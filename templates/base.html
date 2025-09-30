@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{% block title %}Attendance Admin{% endblock %}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div class="min-h-screen flex">
+    <aside class="w-64 shrink-0 bg-white border-r">
+      <div class="px-5 py-4 border-b">
+        <div class="text-xl font-semibold">Attendance Admin</div>
+        <div class="text-xs text-slate-500">Mock UI</div>
+      </div>
+      <nav class="p-3 space-y-1">
+        <a href="/" class="nav-item {% if nav=='home' %}active{% endif %}"><span>🏠</span><span>Home</span></a>
+        <a href="/attendance-ui" class="nav-item {% if nav=='attendance' %}active{% endif %}"><span>🗒️</span><span>Attendance</span></a>
+        <a href="/settings" class="nav-item {% if nav=='settings' %}active{% endif %}"><span>⚙️</span><span>Settings</span></a>
+      </nav>
+    </aside>
+
+    <main class="flex-1">
+      <header class="bg-white border-b">
+        <div class="max-w-6xl mx-auto px-6 py-4">
+          {% block header %}{% endblock %}
+        </div>
+      </header>
+      <section class="max-w-6xl mx-auto px-6 py-6">
+        {% block content %}{% endblock %}
+      </section>
+    </main>
+  </div>
+
+  {% block scripts %}{% endblock %}
+</body>
+</html>
