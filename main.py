@@ -1,37 +1,44 @@
-# main.py — Flask version of the PC base station
-import os, json, pathlib
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
-import paho.mqtt.client as mqtt
+from db import get_db_connection
+import psycopg2
+import pathlib
+from datetime import datetime
 
-# ------- config -------
-BROKER_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
-BROKER_PORT = int(os.getenv("MQTT_PORT", "1883"))
-PI_ID       = os.getenv("PI_ID", "pi-1")
 
-BASE_DIR = pathlib.Path(__file__).resolve().parent
-UPLOADS = BASE_DIR / "uploads"
-UPLOADS.mkdir(exist_ok=True)
 
 # ------- Flask app -------
 app = Flask(__name__, static_folder="static", template_folder="templates")
 CORS(app)
-app.config["UPLOAD_FOLDER"] = str(UPLOADS)
 
-# ------- mock in-memory data -------
-students = []
-rfid_cards = []
-sessions = []
-attendance = []
+#path to store uploads
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+UPLOADS = BASE_DIR / "static" / "uploads"
+UPLOADS.mkdir(parents=True, exist_ok=True)
 
 # ------- helpers -------
 def find_student_id_by_uid(uid_hex):
-    for c in rfid_cards:
-        if c["uid_hex"].lower() == uid_hex.lower():
-            return c["student_id"]
-    return None
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM students WHERE LOWER(rfid_uid) = LOWER(%s)", (uid_hex,))
+            student = cur.fetchone()
+            return student["id"] if student else None
+
+# Temporary debug route to test DB connection
+@app.route("/test-students")
+def test_students():
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM sessions")
+                count = cur.fetchone()["count"]
+        return jsonify({"count": count})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 
 # ------- UI routes -------
 @app.route("/")
@@ -47,146 +54,176 @@ def settings_ui():
     return render_template("settings.html", nav="settings")
 
 # ------- API routes -------
+# search students with optional search : name or index_no will make changes in funtion later
 @app.route("/students", methods=["GET"])
 def list_students():
+    print("search for student...")
     search = request.args.get("search", "").lower()
-    if not search:
-        return jsonify(students)
-    results = [s for s in students if search in s["full_name"].lower() or search in s["index_no"].lower()]
-    return jsonify(results)
+    try:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            if search:
+                cur.execute("""
+                    SELECT id, registration_number AS index_no, name AS full_name
+                    FROM students
+                    WHERE LOWER(name) LIKE %s OR LOWER(registration_number) LIKE %s
+                """, (f"%{search}%", f"%{search}%"))
+            else:
+                cur.execute("""
+                    SELECT id, registration_number AS index_no, name AS full_name
+                    FROM students
+                """)
+            students = cur.fetchall()
+    except Exception as e:
+        print(f"DB Error: {e}")
+        return jsonify({"error": "An error occurred while querying the database."}), 500
 
-@app.route("/students", methods=["POST"])
+    if not students:
+        msg = "Student database is empty." if not search else "No matching student found."
+        return jsonify({"error": msg}), 404
+
+    return jsonify(students)
+
+
+
+# create a new student
+@app.route("/add-student", methods=["POST"])
 def create_student():
     data = request.get_json()
-    new = {
-        "id": len(students) + 1,
-        "index_no": data["index_no"],
-        "full_name": data["full_name"]
-    }
-    students.append(new)
-    return jsonify(new), 201
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO students (name, registration_number, rfid_uid, class, photo_path) VALUES (%s, %s, %s, %s, %s)" \
+        " RETURNING *", (
+                          data["name"], 
+                          data["registration_number"], 
+                          data.get("rfid_uid"), 
+                          data.get("class"), 
+                          data.get("photo_path")))
+        new_student = cur.fetchone()
+        conn.commit()
+    return jsonify(new_student), 201
 
 @app.route("/rfid", methods=["POST"])
 def link_rfid():
     data = request.get_json()
     uid = data["uid_hex"]
     sid = int(data["student_id"])
+
     if find_student_id_by_uid(uid):
         return jsonify({"error": "UID already linked"}), 409
-    new = {
-        "id": len(rfid_cards) + 1,
-        "student_id": sid,
-        "uid_hex": uid
-    }
-    rfid_cards.append(new)
-    return jsonify(new), 201
+
+    if not uid or not sid:
+        return jsonify({"error": "uid_hex and student_id are required"}), 400
+
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+         # Check if UID is already in use
+        cur.execute("SELECT id FROM students WHERE rfid_uid = %s", (uid,))
+
+        if cur.fetchone():
+            return jsonify({"error": "UID already linked to a student"}), 409
+
+        # Update the student record with the new UID
+        cur.execute("""
+            UPDATE students
+            SET rfid_uid = %s
+            WHERE id = %s
+            RETURNING id, name, registration_number, rfid_uid
+            """, (uid, sid))
+
+        updated = cur.fetchone()
+        if not updated:
+            return jsonify({"error": "Student not found"}), 404
+
+        conn.commit()
+    return jsonify(updated), 200
 
 @app.route("/sessions/active")
 def get_active_session():
-    return jsonify(sessions[-1] if sessions else None)
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1")
+        session = cur.fetchone()
+    if not session:
+        return jsonify({"error": "No active session"}), 404
+    return jsonify(session)
 
 @app.route("/sessions", methods=["POST"])
 def create_session():
     data = request.get_json()
-    code = data.get("course_code", "").strip().upper()
+    code = data.get("course_code").strip().upper()
+    # Validate course code format
     if not code:
         return jsonify({"error": "course_code required"}), 400
-    new = {
-        "id": len(sessions) + 1,
-        "course_code": code,
-        "started_at": datetime.utcnow().isoformat() + "Z"
-    }
-    sessions.append(new)
-    return jsonify(new), 201
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        # Check if there's already an active session for this course
+        cur.execute("INSERT INTO sessions (course_code, started_at) VALUES (%s, %s) RETURNING *",
+                    (code, datetime.now(datetime.timezone.utc)))
+        new_session = cur.fetchone()
+        conn.commit()
+    return jsonify(new_session), 201
 
-@app.route("/attendance")
-def list_attendance():
-    session_id = request.args.get("session_id", type=int)
-    if session_id is None:
-        return jsonify({"error": "Missing session_id"}), 400
-    logs = [a for a in attendance if a["session_id"] == session_id]
-    return jsonify(logs)
+@app.route("/sessions/<int:session_id>/end", methods=["POST"])
+def end_session(session_id):
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE sessions SET ended_at = %s WHERE id = %s RETURNING *",
+                    (datetime.now(datetime.timezone.utc), session_id))
+        ended_session = cur.fetchone()
+        if not ended_session:
+            return jsonify({"error": "Session not found"}), 404
+        conn.commit()
+    return jsonify(ended_session)
 
-# ------- MQTT setup -------
-mqtt_client = mqtt.Client(client_id="admin-backend")
 
-def mqtt_connect():
-    try:
-        mqtt_client.connect(BROKER_HOST, BROKER_PORT, keepalive=30)
-        mqtt_client.loop_start()
-        print("MQTT connected.")
-    except Exception as e:
-        print(f"MQTT connection failed: {e}")
+@app.route("/attendance", methods=["POST"])
+def log_attendance():
+    uid = request.form.get("rfid_uid")
+    photo = request.files.get("photo")
 
-mqtt_connect()
+    if not uid or not photo:
+        return jsonify({"error": "rfid_uid and photo are required"}), 400
 
-def publish_cmd(cmd):
-    topic = f"attend/cmd/{PI_ID}"
-    mqtt_client.publish(topic, json.dumps(cmd), qos=1, retain=False)
-
-def publish_event(evt):
-    topic = f"attend/events/{PI_ID}"
-    mqtt_client.publish(topic, json.dumps(evt), qos=1, retain=False)
-
-@app.route("/cmd", methods=["POST"])
-def post_cmd():
-    data = request.get_json()
-    if "type" not in data:
-        return jsonify({"error": "missing 'type'"}), 400
-    publish_cmd(data)
-    return jsonify({"ok": True})
-
-# ------- verify face & upload -------
-@app.route("/verify-face", methods=["POST"])
-def verify_face():
-    if not sessions:
-        return jsonify({"error": "No active session"}), 400
-
-    uid_hex = request.form.get("uid_hex")
-    image = request.files.get("image")
-
-    if not uid_hex or not image:
-        return jsonify({"error": "uid_hex and image required"}), 400
-
-    student_id = find_student_id_by_uid(uid_hex)
-    if not student_id:
-        return jsonify({"error": "RFID not linked to a student"}), 404
-
-    filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{secure_filename(uid_hex)}.jpg"
+    # Save photo to /static/uploads
+    filename = secure_filename(f"{datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uid}.jpg")
     save_path = UPLOADS / filename
-    image.save(save_path)
+    photo.save(save_path)
+    photo_url = f"/static/uploads/{filename}"
 
-    face_ok = True  # Stub for actual face recognition
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        # Get student by UID
+        cur.execute("SELECT id FROM students WHERE rfid_uid = %s", (uid,))
+        student = cur.fetchone()
+        if not student:
+            return jsonify({"error": "RFID not linked to any student"}), 404
 
-    log = {
-        "id": len(attendance) + 1,
-        "session_id": sessions[-1]["id"],
-        "student_id": student_id,
-        "rfid_ok": True,
-        "face_ok": face_ok,
-        "created_at": datetime.utcnow().isoformat() + "Z"
-    }
-    attendance.append(log)
+        student_id = student["id"]
 
-    publish_event({
-        "type": "attendance_logged",
-        "student_id": student_id,
-        "session_id": log["session_id"],
-        "ts": log["created_at"]
-    })
+        # Get current active session (if using sessions)
+        cur.execute("SELECT id FROM sessions WHERE ended_at IS NULL ORDER BY started_at DESC LIMIT 1")
+        session = cur.fetchone()
+        if not session:
+            return jsonify({"error": "No active sessions"}), 400
 
-    return jsonify({
-        "ok": True,
-        "student_id": student_id,
-        "attendance_id": log["id"],
-        "face_ok": face_ok
-    })
+        session_id = session["id"]
 
-# ------- static file serving (if needed) -------
-@app.route("/static/<path:filename>")
-def serve_static(filename):
-    return send_from_directory(app.static_folder, filename)
+        # Log attendance
+        try:
+            cur.execute("""
+                INSERT INTO attendance (student_id, session_id, live_photo_path, status)
+                VALUES (%s, %s, %s, %s)
+                RETURNING *
+            """, (student_id, session_id, photo_url, "present"))
+            log = cur.fetchone()
+            conn.commit()
+            return jsonify(log), 201
 
+        except psycopg2.IntegrityError:
+            conn.rollback()
+            return jsonify({"error": "Attendance already logged for this session or today"}), 409
+        
 # ------- main -------
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=8000)

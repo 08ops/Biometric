@@ -11,6 +11,9 @@
     <button id="searchBtn" class="btn-primary">Search</button>
   </div>
   <div class="text-xs text-slate-500 mt-2">Press Enter to search • Add demo data below</div>
+
+    <!-- 👇 New result display area -->
+  <div id="searchResult" class="mt-4 text-sm text-slate-700"></div>
 </div>
 
 <div class="card p-5 mt-4">
@@ -18,9 +21,15 @@
   <div class="grid md:grid-cols-2 gap-2">
     <input id="idx" class="input" placeholder="Index No e.g. UG1234567" />
     <input id="name" class="input" placeholder="Full name e.g. Ama Mensah" />
+    <input id="rfid" class="input" placeholder="RFID UID (optional)" />
+    <input id="class" class="input" placeholder="Class (optional)" />
+    <input id="photo" class="input" placeholder="Photo path (optional)" />
   </div>
   <button id="addBtn" class="btn-outline mt-2">Add</button>
 </div>
+
+<!-- Toast Notification Container -->
+<div id="toast" class="fixed top-5 right-5 bg-slate-800 text-white px-16 py-8 rounded shadow-lg opacity-0 transition-opacity duration-300 z-50"></div>
 
 <div class="card p-0 mt-4 overflow-hidden">
   <div class="table-wrap">
@@ -38,32 +47,106 @@
 {% block scripts %}
 <script>
 const el = id => document.getElementById(id);
-const api = async (p,o={})=>{
-  const r = await fetch(p,{headers:{'Content-Type':'application/json'},...o});
-  if(!r.ok) throw new Error(await r.text()); return r.json();
+// Toast notification function
+function showToast(message, duration = 3000) {
+  const toast = document.getElementById("toast");
+  toast.textContent = message;
+  toast.classList.remove("opacity-0");
+  toast.classList.add("opacity-100");
+
+  // Hide after duration
+  setTimeout(() => {
+    toast.classList.remove("opacity-100");
+    toast.classList.add("opacity-0");
+  }, duration);
+}
+
+const api = async (p, o = {}) => {
+  const r = await fetch(p, {
+    headers: { 'Content-Type': 'application/json' },
+    ...o
+  });
+
+  if (r.status === 404) {
+    const data = await r.json();
+    return { error: data.message || "Not found" };
+  }
+
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
 };
-async function search(){
+
+async function search() {
   const q = el('q').value.trim();
   const url = q ? `/students?search=${encodeURIComponent(q)}` : '/students';
-  const rows = await api(url);
-  const body = el('resultsBody');
-  body.innerHTML = rows.length ? rows.map(s=>`
-    <tr>
-      <td>${s.id}</td><td>${s.index_no}</td><td>${s.full_name}</td>
-      <td><button class="btn-ghost" onclick="alert('Open student ${s.id}')">View</button></td>
-    </tr>`).join('')
-    : `<tr><td colspan="4" class="py-6 text-center text-slate-500">No matches.</td></tr>`;
+  const resultBox = el('searchResult');
+
+  try {
+    const rows = await api(url);
+
+    if (rows.length === 0) {
+      resultBox.innerHTML = '';
+      showToast('No student found ❌');
+      return;
+    }
+
+    const student = rows[0];
+   resultBox.innerHTML = `
+  <div class="p-3 bg-green-50 border border-green-200 rounded relative">
+    <button onclick="document.getElementById('searchResult').innerHTML=''"
+            class="absolute top-1 right-2 text-sm text-red-500 hover:underline">
+      ✖ Close
+    </button>
+    <div><strong>ID:</strong> ${student.id}</div>
+    <div><strong>Name:</strong> ${student.full_name}</div>
+    <div><strong>Index No:</strong> ${student.index_no}</div>
+  </div>
+`;
+
+  } catch (err) {
+    resultBox.innerHTML = '';
+    showToast('Error fetching student ❌');
+  }
 }
+
+
+
 el('searchBtn').onclick = search;
 el('q').addEventListener('keydown', e => { if(e.key==='Enter') search(); });
 
-el('addBtn').onclick = async ()=>{
+el('addBtn').onclick = async () => {
   const index_no = el('idx').value.trim();
   const full_name = el('name').value.trim();
-  if(!index_no || !full_name) return alert('Provide both fields');
-  await api('/students',{method:'POST',body:JSON.stringify({index_no, full_name})});
-  el('idx').value = ""; el('name').value = "";
-  search();
+
+  if (!index_no || !full_name) {
+    showToast('Provide both fields');
+    return;
+  }
+
+  try {
+    await api('/add-student', {
+      method: 'POST',
+      body: JSON.stringify({
+        registration_number: index_no,
+        name: full_name,
+        rfid_uid: null,
+        class: null,
+        photo_path: null
+      })
+    });
+
+    el('idx').value = "";
+    el('name').value = "";
+    showToast('Student added successfully ✅');
+
+    // Don't call search() here anymore
+    // Optionally clear previous result box
+    el('searchResult').innerHTML = '';
+
+  } catch (err) {
+    showToast('Error adding student ❌');
+  }
 };
+
 </script>
 {% endblock %}
