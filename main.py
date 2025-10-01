@@ -1,153 +1,192 @@
-# main.py — PC base station (MQTT broker + admin API + verify endpoint)
+# main.py — Flask version of the PC base station
 import os, json, pathlib
 from datetime import datetime
-from typing import List, Optional
-from fastapi import FastAPI, Request, HTTPException, UploadFile, File, Form, Body
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
 import paho.mqtt.client as mqtt
 
 # ------- config -------
-BROKER_HOST = os.getenv("MQTT_HOST", "127.0.0.1")  # your PC (broker)
+BROKER_HOST = os.getenv("MQTT_HOST", "127.0.0.1")
 BROKER_PORT = int(os.getenv("MQTT_PORT", "1883"))
 PI_ID       = os.getenv("PI_ID", "pi-1")
 
-# uploads (optional)
-UPLOADS = pathlib.Path("uploads"); UPLOADS.mkdir(exist_ok=True)
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+UPLOADS = BASE_DIR / "uploads"
+UPLOADS.mkdir(exist_ok=True)
 
-# ------- app + static -------
-app = FastAPI(title="Attendance Admin")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
-                   allow_methods=["*"], allow_headers=["*"])
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+# ------- Flask app -------
+app = Flask(__name__, static_folder="static", template_folder="templates")
+CORS(app)
+app.config["UPLOAD_FOLDER"] = str(UPLOADS)
 
-# ------- simple UI pages -------
-@app.get("/", response_class=HTMLResponse)
-def home(request: Request):
-    return templates.TemplateResponse("home.html", {"request": request, "nav":"home"})
+# ------- mock in-memory data -------
+students = []
+rfid_cards = []
+sessions = []
+attendance = []
 
-@app.get("/attendance-ui", response_class=HTMLResponse)
-def attendance_page(request: Request):
-    return templates.TemplateResponse("attendance.html", {"request": request, "nav":"attendance"})
-
-@app.get("/settings", response_class=HTMLResponse)
-def settings_page(request: Request):
-    return templates.TemplateResponse("settings.html", {"request": request, "nav":"settings"})
-
-# ------- data models (mock/in-memory for now) -------
-class Student(BaseModel):
-    id: int
-    index_no: str
-    full_name: str
-
-class RFIDCard(BaseModel):
-    id: int
-    student_id: int
-    uid_hex: str
-
-class Session(BaseModel):
-    id: int
-    course_code: str
-    started_at: str
-
-class AttendanceLog(BaseModel):
-    id: int
-    session_id: int
-    student_id: int
-    rfid_ok: bool
-    face_ok: bool
-    created_at: str
-
-students: List[Student] = []
-rfid_cards: List[RFIDCard] = []
-sessions: List[Session] = []
-attendance: List[AttendanceLog] = []
-
-def find_student_id_by_uid(uid_hex: str) -> Optional[int]:
+# ------- helpers -------
+def find_student_id_by_uid(uid_hex):
     for c in rfid_cards:
-        if c.uid_hex.lower() == uid_hex.lower():
-            return c.student_id
+        if c["uid_hex"].lower() == uid_hex.lower():
+            return c["student_id"]
     return None
 
-# ------- REST API (UI uses these) -------
-@app.get("/students", response_model=List[Student])
-def list_students(search: Optional[str] = None):
-    if not search: return students
-    q = search.lower()
-    return [s for s in students if q in s.full_name.lower() or q in s.index_no.lower()]
+# ------- UI routes -------
+@app.route("/")
+def home():
+    return render_template("home.html", nav="home")
 
-@app.post("/students", response_model=Student)
-def create_student(payload: dict):
-    new = Student(id=len(students)+1, index_no=payload["index_no"], full_name=payload["full_name"])
-    students.append(new); return new
+@app.route("/attendance-ui")
+def attendance_ui():
+    return render_template("attendance.html", nav="attendance")
 
-@app.post("/rfid", response_model=RFIDCard)
-def link_rfid(payload: dict):
-    uid = payload["uid_hex"]; sid = int(payload["student_id"])
-    if find_student_id_by_uid(uid): raise HTTPException(409, "UID already linked")
-    new = RFIDCard(id=len(rfid_cards)+1, student_id=sid, uid_hex=uid)
-    rfid_cards.append(new); return new
+@app.route("/settings")
+def settings_ui():
+    return render_template("settings.html", nav="settings")
 
-@app.get("/sessions/active")
-def get_active():
-    return sessions[-1] if sessions else None
+# ------- API routes -------
+@app.route("/students", methods=["GET"])
+def list_students():
+    search = request.args.get("search", "").lower()
+    if not search:
+        return jsonify(students)
+    results = [s for s in students if search in s["full_name"].lower() or search in s["index_no"].lower()]
+    return jsonify(results)
 
-@app.post("/sessions", response_model=Session)
-def create_session(payload: dict):
-    code = str(payload.get("course_code","")).upper()
-    if not code: raise HTTPException(400, "course_code required")
-    new = Session(id=len(sessions)+1, course_code=code, started_at=datetime.utcnow().isoformat()+"Z")
-    sessions.append(new); return new
+@app.route("/students", methods=["POST"])
+def create_student():
+    data = request.get_json()
+    new = {
+        "id": len(students) + 1,
+        "index_no": data["index_no"],
+        "full_name": data["full_name"]
+    }
+    students.append(new)
+    return jsonify(new), 201
 
-@app.get("/attendance", response_model=List[AttendanceLog])
-def list_attendance(session_id: int):
-    return [a for a in attendance if a.session_id == session_id]
+@app.route("/rfid", methods=["POST"])
+def link_rfid():
+    data = request.get_json()
+    uid = data["uid_hex"]
+    sid = int(data["student_id"])
+    if find_student_id_by_uid(uid):
+        return jsonify({"error": "UID already linked"}), 409
+    new = {
+        "id": len(rfid_cards) + 1,
+        "student_id": sid,
+        "uid_hex": uid
+    }
+    rfid_cards.append(new)
+    return jsonify(new), 201
 
-# ------- MQTT bridge (frontend buttons -> Pi) -------
+@app.route("/sessions/active")
+def get_active_session():
+    return jsonify(sessions[-1] if sessions else None)
+
+@app.route("/sessions", methods=["POST"])
+def create_session():
+    data = request.get_json()
+    code = data.get("course_code", "").strip().upper()
+    if not code:
+        return jsonify({"error": "course_code required"}), 400
+    new = {
+        "id": len(sessions) + 1,
+        "course_code": code,
+        "started_at": datetime.utcnow().isoformat() + "Z"
+    }
+    sessions.append(new)
+    return jsonify(new), 201
+
+@app.route("/attendance")
+def list_attendance():
+    session_id = request.args.get("session_id", type=int)
+    if session_id is None:
+        return jsonify({"error": "Missing session_id"}), 400
+    logs = [a for a in attendance if a["session_id"] == session_id]
+    return jsonify(logs)
+
+# ------- MQTT setup -------
 mqtt_client = mqtt.Client(client_id="admin-backend")
+
 def mqtt_connect():
-    mqtt_client.connect(BROKER_HOST, BROKER_PORT, keepalive=30)
-    mqtt_client.loop_start()
+    try:
+        mqtt_client.connect(BROKER_HOST, BROKER_PORT, keepalive=30)
+        mqtt_client.loop_start()
+        print("MQTT connected.")
+    except Exception as e:
+        print(f"MQTT connection failed: {e}")
+
 mqtt_connect()
 
-def publish_cmd(cmd: dict):
+def publish_cmd(cmd):
     topic = f"attend/cmd/{PI_ID}"
     mqtt_client.publish(topic, json.dumps(cmd), qos=1, retain=False)
 
-def publish_event(evt: dict):
+def publish_event(evt):
     topic = f"attend/events/{PI_ID}"
     mqtt_client.publish(topic, json.dumps(evt), qos=1, retain=False)
 
-@app.post("/cmd")
-def post_cmd(payload: dict = Body(...)):
-    if "type" not in payload: raise HTTPException(400, "missing 'type'")
-    publish_cmd(payload)
-    return {"ok": True}
+@app.route("/cmd", methods=["POST"])
+def post_cmd():
+    data = request.get_json()
+    if "type" not in data:
+        return jsonify({"error": "missing 'type'"}), 400
+    publish_cmd(data)
+    return jsonify({"ok": True})
 
-# ------- Pi -> PC: verify face + log attendance -------
-@app.post("/verify-face")
-async def verify_face(uid_hex: str = Form(...), image: UploadFile = File(...)):
-    if not sessions: raise HTTPException(400, "No active session")
+# ------- verify face & upload -------
+@app.route("/verify-face", methods=["POST"])
+def verify_face():
+    if not sessions:
+        return jsonify({"error": "No active session"}), 400
+
+    uid_hex = request.form.get("uid_hex")
+    image = request.files.get("image")
+
+    if not uid_hex or not image:
+        return jsonify({"error": "uid_hex and image required"}), 400
+
     student_id = find_student_id_by_uid(uid_hex)
-    if not student_id: raise HTTPException(404, "RFID not linked to a student")
+    if not student_id:
+        return jsonify({"error": "RFID not linked to a student"}), 404
 
-    # save image (optional) then "verify" (stub true)
-    data = await image.read()
-    (UPLOADS / f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uid_hex}.jpg").write_bytes(data)
-    face_ok = True
+    filename = f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{secure_filename(uid_hex)}.jpg"
+    save_path = UPLOADS / filename
+    image.save(save_path)
 
-    log = AttendanceLog(
-        id=len(attendance)+1,
-        session_id=sessions[-1].id,
-        student_id=student_id,
-        rfid_ok=True, face_ok=face_ok,
-        created_at=datetime.utcnow().isoformat()+"Z"
-    )
+    face_ok = True  # Stub for actual face recognition
+
+    log = {
+        "id": len(attendance) + 1,
+        "session_id": sessions[-1]["id"],
+        "student_id": student_id,
+        "rfid_ok": True,
+        "face_ok": face_ok,
+        "created_at": datetime.utcnow().isoformat() + "Z"
+    }
     attendance.append(log)
-    publish_event({"type":"attendance_logged","student_id":student_id,"session_id":log.session_id,"ts":log.created_at})
 
-    return {"ok": True, "student_id": student_id, "attendance_id": log.id, "face_ok": face_ok}
+    publish_event({
+        "type": "attendance_logged",
+        "student_id": student_id,
+        "session_id": log["session_id"],
+        "ts": log["created_at"]
+    })
+
+    return jsonify({
+        "ok": True,
+        "student_id": student_id,
+        "attendance_id": log["id"],
+        "face_ok": face_ok
+    })
+
+# ------- static file serving (if needed) -------
+@app.route("/static/<path:filename>")
+def serve_static(filename):
+    return send_from_directory(app.static_folder, filename)
+
+# ------- main -------
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=8000)
