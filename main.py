@@ -1,12 +1,12 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from db import get_db_connection
 import psycopg2
 import pathlib
-from datetime import datetime
 
+now = datetime.now(timezone.utc)
 
 
 # ------- Flask app -------
@@ -159,22 +159,58 @@ def create_session():
         cur = conn.cursor()
         # Check if there's already an active session for this course
         cur.execute("INSERT INTO sessions (course_code, started_at) VALUES (%s, %s) RETURNING *",
-                    (code, datetime.now(datetime.timezone.utc)))
+                    (code, now))
         new_session = cur.fetchone()
         conn.commit()
     return jsonify(new_session), 201
 
-@app.route("/sessions/<int:session_id>/end", methods=["POST"])
+@app.route("/sessions/<string:session_id>/end", methods=["POST"])
 def end_session(session_id):
     with get_db_connection() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE sessions SET ended_at = %s WHERE id = %s RETURNING *",
-                    (datetime.now(datetime.timezone.utc), session_id))
+        cur.execute("UPDATE sessions SET ended_at = %s WHERE course_code = %s RETURNING *",
+                    (now, session_id))
         ended_session = cur.fetchone()
         if not ended_session:
             return jsonify({"error": "Session not found"}), 404
         conn.commit()
     return jsonify(ended_session)
+
+@app.route("/begin-attendance", methods=["POST"])
+def begin_attendance():
+    try:
+        # 🔌 Call your actual RFID reader function here
+        uid = read_rfid()  # Implement this in rfid_reader.py
+
+        if not uid:
+            return jsonify({"error": "No RFID UID received"}), 400
+
+        timestamp = datetime.now(timezone.utc)
+
+        # Lookup student by UID
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, registration_number, rfid_uid
+                FROM students
+                WHERE rfid_uid = %s
+            """, (uid,))
+            student = cur.fetchone()
+
+        if not student:
+            return jsonify({"error": "RFID not linked to any student"}), 404
+
+        return jsonify({
+            "timestamp": timestamp.isoformat(),
+            "student_id": student["id"],
+            "registration_number": student["registration_number"],
+            "rfid_uid": student["rfid_uid"]
+        })
+
+    except Exception as e:
+        print("Error in begin_attendance:", e)
+        return jsonify({"error": str(e)}), 500
+
 
 
 @app.route("/attendance", methods=["POST"])

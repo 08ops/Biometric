@@ -3,23 +3,29 @@
 {% block header %}
 <div class="flex items-center justify-between">
   <div>
-    <h1 class="text-2xl font-semibold">Attendance</h1>
+    <h1 class="text-2xl font-semibold">Sessions</h1>
     <p class="text-sm text-slate-500">Start/End session and view logs.</p>
   </div>
   <div class="flex gap-2">
-    <button id="startBtn" class="btn-primary">Start Attendance</button>
-    <button id="endBtn" class="btn-outline">End Attendance</button>
+    <button id="startBtn" class="btn-primary">Star Session</button>
+    <button id="endBtn" class="btn-outline">End Session</button>
   </div>
 </div>
 {% endblock %}
 {% block content %}
 <div id="sessionBanner" class="card p-4 mb-4 hidden"></div>
 
+<!-- 
+  if the  begin attendance btn is clicked, when a user scans their rfid, the data taken is
+  verified using t5he camera and then the data shows here
+-->
+<button id="beginBtn" class="btn btn-primary">Begin Attendance</button>
+
 <div class="card p-0 overflow-hidden">
   <div class="table-wrap">
     <table class="table">
       <thead>
-        <tr><th class="w-40">Time</th><th class="w-28">Student ID</th><th>RFID</th><th>Face</th></tr>
+        <tr><th class="w-40">Time</th><th class="w-28">Student ID</th><th>RFID</th><th>REG_NUMBER</th></tr>
       </thead>
       <tbody id="logsBody">
         <tr><td colspan="4" class="py-6 text-center text-slate-500">No logs yet.</td></tr>
@@ -29,5 +35,5 @@
 </div>
 {% endblock %}
 {% block scripts %}
-<script src="/static/js/attendance.js"></script>
+<script src={{ url_for('static', filename='js/attendance.js') }}></script>
 {% endblock %}
